@@ -14,6 +14,19 @@ use ffmpeg_next as ffmpeg;
 const AV_TIME_BASE: f64 = 1_000_000.0;
 const PREVIEW_MAX_W: u32 = 960;
 
+/// Returns the bundled `ffmpeg` binary if it lives next to the executable
+/// (macOS .app, Windows zip), otherwise falls back to `ffmpeg` on PATH.
+fn bundled_ffmpeg() -> std::ffi::OsString {
+    if let Ok(mut path) = std::env::current_exe() {
+        path.pop();
+        let candidate = path.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+        if candidate.exists() {
+            return candidate.into_os_string();
+        }
+    }
+    std::ffi::OsString::from("ffmpeg")
+}
+
 fn main() -> eframe::Result<()> {
     ffmpeg::init().expect("ffmpeg init");
     ffmpeg::util::log::set_level(ffmpeg::util::log::Level::Fatal);
@@ -270,7 +283,7 @@ impl ClipperApp {
                 args.extend(["-movflags".into(), "+faststart".into()]);
                 args.push(out.to_string_lossy().into_owned());
 
-                let res = Command::new("ffmpeg").args(&args).output();
+                let res = Command::new(bundled_ffmpeg()).args(&args).output();
                 let msg = match res {
                     Ok(o) if o.status.success() => {
                         format!("[{}/{}] {}", i + 1, regions.len(), out.display())

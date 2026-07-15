@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: rustjay-clipper
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: rustjay-clipper
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: rustjay-clipper.exe
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('.github/workflows/release.yml') }}
+          restore-keys: |
+            ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ matrix.target }}-cargo-
+
+      # ── Linux ──────────────────────────────────────────────────────────────
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libavfilter-dev libavdevice-dev libswscale-dev \
+            libswresample-dev pkg-config
+
+      # ── macOS ──────────────────────────────────────────────────────────────
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg pkg-config
+
+      # ── Windows ────────────────────────────────────────────────────────────
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # ffmpeg-next 8.x targets FFmpeg 7.x; BtbN n7.1 builds live in dated autobuild releases, not the "latest" tag
+          $releases = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases?per_page=30" `
+            -Headers @{ Authorization = "token $env:GH_TOKEN"; "User-Agent" = "gh-actions" }
+          $asset = $null
+          foreach ($r in $releases) {
+            $found = $r.assets | Where-Object { $_.name -match "ffmpeg-n7\.1-latest-win64-gpl-shared.*\.zip" }
+            if ($found) { $asset = $found[0]; break }
+          }
+          if (-not $asset) { throw "Could not find FFmpeg n7.1 build in recent releases" }
+          Write-Host "Downloading $($asset.browser_download_url)"
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          $dir = "$env:RUNNER_TEMP\ffmpeg"
+          Invoke-WebRequest $asset.browser_download_url -OutFile $zip
+          Expand-Archive $zip -DestinationPath $dir
+          $inner = Get-ChildItem $dir -Directory | Select-Object -First 1
+          echo "FFMPEG_DIR=$($inner.FullName)" >> $env:GITHUB_ENV
+          echo "$($inner.FullName)\bin" >> $env:GITHUB_PATH
+
+      # ffmpeg-sys-next caches absolute library paths from $FFMPEG_DIR, but
+      # that directory changes on every CI run (RUNNER_TEMP). Force a rebuild
+      # so the linker gets the correct cargo:rustc-link-search path.
+      - name: Clean ffmpeg-sys-next cache (Windows)
+        if: runner.os == 'Windows'
+        run: if (Test-Path target) { Remove-Item -Recurse -Force target\release\build\ffmpeg-sys-next-* }
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ── Package artifacts ──────────────────────────────────────────────────
+      - name: Package (macOS .app + .dmg)
+        if: runner.os == 'macOS'
+        run: |
+          brew install dylibbundler
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP="RustJay Clipper.app"
+          DMG="rustjay-clipper-${{ github.ref_name }}-${{ matrix.target }}.dmg"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} "$APP/Contents/MacOS/"
+          cp "$(brew --prefix)/bin/ffmpeg" "$APP/Contents/MacOS/"
+          chmod +x "$APP/Contents/MacOS/"*
+          sed "s/VERSION/$VERSION/g" macos/Info.plist > "$APP/Contents/Info.plist"
+          # Bundle dylibs for both the app and the ffmpeg binary
+          dylibbundler -od -b \
+            -x "$APP/Contents/MacOS/${{ matrix.artifact }}" \
+            -x "$APP/Contents/MacOS/ffmpeg" \
+            -d "$APP/Contents/Frameworks/" \
+            -p @executable_path/../Frameworks/
+          codesign --force --deep -s - "$APP"
+          hdiutil create -volname "RustJay Clipper" -srcfolder "$APP" -ov -format UDZO "$DMG"
+          echo "ASSET=$DMG" >> $GITHUB_ENV
+
+      - name: Package (Linux .tar.gz)
+        if: runner.os == 'Linux'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf rustjay-clipper-${{ github.ref_name }}-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          echo "ASSET=target/${{ matrix.target }}/release/rustjay-clipper-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" >> $GITHUB_ENV
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "rustjay-clipper-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          $staging = "$env:RUNNER_TEMP\staging"
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.artifact }}" $staging
+          # Bundle ffmpeg.exe and DLLs so the app is self-contained
+          Copy-Item "$env:FFMPEG_DIR\bin\ffmpeg.exe" $staging
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $staging
+          Compress-Archive -Path "$staging\*" -DestinationPath $name
+          echo "ASSET=$name" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rustjay-clipper-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*
+          generate_release_notes: true
