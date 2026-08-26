@@ -333,13 +333,13 @@ impl ClipperApp {
             painter.vline(
                 to_x(a),
                 rect.y_range(),
-                egui::Stroke::new(2.0, egui::Color32::YELLOW),
+                egui::Stroke::new(2.0_f32, egui::Color32::YELLOW),
             );
         }
         painter.vline(
             to_x(self.playhead_s),
             rect.y_range(),
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 80, 80)),
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 80, 80)),
         );
 
         if response.clicked() || response.dragged() {
