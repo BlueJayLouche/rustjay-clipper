@@ -1,7 +1,8 @@
 //! rustjay-clipper — load a long video instantly (no transcode, no RAM copy),
 //! scrub it, mark multiple in/out regions, and export each region as its own
 //! clip. H.264 sources export via stream copy (no re-encode, cuts snap to the
-//! previous keyframe); anything else re-encodes to H.264.
+//! previous keyframe); anything else — or any of the HDR / 4K options —
+//! re-encodes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,6 +55,7 @@ struct Player {
     pub fps: f64,
     pub duration_s: f64,
     pub is_h264: bool,
+    pub is_hdr: bool,
     pub src_dims: (u32, u32),
     out_dims: (u32, u32),
     /// Presentation time of the last decoded frame, for the sequential
@@ -87,6 +89,12 @@ impl Player {
             .video()
             .map_err(|e| e.to_string())?;
 
+        let is_hdr = matches!(
+            decoder.color_transfer_characteristic(),
+            ffmpeg::color::TransferCharacteristic::SMPTE2084
+                | ffmpeg::color::TransferCharacteristic::ARIB_STD_B67
+        );
+
         let (sw, sh) = (decoder.width(), decoder.height());
         if sw == 0 || sh == 0 {
             return Err("stream has no dimensions".into());
@@ -113,6 +121,7 @@ impl Player {
             fps,
             duration_s: duration_s.max(0.0),
             is_h264,
+            is_hdr,
             src_dims: (sw, sh),
             out_dims: (dw, dh),
             last_decoded_s: f64::NEG_INFINITY,
@@ -190,6 +199,8 @@ struct ClipperApp {
     tex: Option<egui::TextureHandle>,
     shown_at: Option<(f64, bool)>,
     force_reencode: bool,
+    hdr: bool,
+    upscale_4k: bool,
     out_dir: Option<PathBuf>,
     export_rx: Option<mpsc::Receiver<String>>,
     exporting: bool,
@@ -201,14 +212,18 @@ impl ClipperApp {
         match Player::open(&path) {
             Ok(p) => {
                 self.status = format!(
-                    "{} — {:.1}s @ {:.2} fps, {}x{}, {}",
+                    "{} — {:.1}s @ {:.2} fps, {}x{}{}, {}",
                     path.file_name().unwrap_or_default().to_string_lossy(),
                     p.duration_s,
                     p.fps,
                     p.src_dims.0,
                     p.src_dims.1,
+                    if p.is_hdr { " HDR" } else { "" },
                     if p.is_h264 { "h264 (stream-copy export)" } else { "will re-encode" },
                 );
+                // Re-encoding an HDR source as 8-bit SDR washes it out, so keep
+                // the 10-bit path on by default when the source is HDR.
+                self.hdr = p.is_hdr;
                 self.player = Some(p);
                 self.path = Some(path);
                 self.regions.clear();
@@ -244,7 +259,8 @@ impl ClipperApp {
             self.status = "No regions to export.".into();
             return;
         }
-        let copy = player.is_h264 && !self.force_reencode;
+        let copy = player.is_h264 && !self.force_reencode && !self.hdr && !self.upscale_4k;
+        let (hdr, upscale_4k, src_hdr) = (self.hdr, self.upscale_4k, player.is_hdr);
         let dir = self
             .out_dir
             .clone()
@@ -260,29 +276,7 @@ impl ClipperApp {
         std::thread::spawn(move || {
             for (i, r) in regions.iter().enumerate() {
                 let out = dir.join(format!("{stem}_c{:02}.mp4", i + 1));
-                let dur = r.end_s - r.start_s;
-                let mut args: Vec<String> = vec![
-                    "-y".into(),
-                    "-ss".into(), format!("{:.3}", r.start_s),
-                    "-i".into(), src.to_string_lossy().into_owned(),
-                    "-t".into(), format!("{:.3}", dur),
-                ];
-                if copy {
-                    // Stream copy: cut snaps back to the previous keyframe, so
-                    // the clip may start slightly early but loses no content.
-                    args.extend(["-c".into(), "copy".into(), "-avoid_negative_ts".into(), "make_zero".into()]);
-                } else {
-                    args.extend([
-                        "-c:v".into(), "libx264".into(),
-                        "-preset".into(), "veryfast".into(),
-                        "-crf".into(), "18".into(),
-                        "-pix_fmt".into(), "yuv420p".into(),
-                        "-c:a".into(), "aac".into(),
-                    ]);
-                }
-                args.extend(["-movflags".into(), "+faststart".into()]);
-                args.push(out.to_string_lossy().into_owned());
-
+                let args = export_args(&src, &out, *r, copy, hdr, upscale_4k, src_hdr);
                 let res = Command::new(bundled_ffmpeg()).args(&args).output();
                 let msg = match res {
                     Ok(o) if o.status.success() => {
@@ -372,9 +366,98 @@ impl ClipperApp {
     }
 }
 
+/// Full ffmpeg argument list for one clip. `copy` is stream copy; otherwise
+/// `hdr` picks 10-bit HEVC (tagged BT.2020/PQ only when the source really is
+/// HDR — nothing here tone-maps SDR) and `upscale_4k` fits the frame to 4K.
+fn export_args(
+    src: &Path,
+    out: &Path,
+    r: Region,
+    copy: bool,
+    hdr: bool,
+    upscale_4k: bool,
+    src_hdr: bool,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-y".into(),
+        "-ss".into(), format!("{:.3}", r.start_s),
+        "-i".into(), src.to_string_lossy().into_owned(),
+        "-t".into(), format!("{:.3}", r.end_s - r.start_s),
+    ];
+    if copy {
+        // Stream copy: cut snaps back to the previous keyframe, so
+        // the clip may start slightly early but loses no content.
+        args.extend(["-c".into(), "copy".into(), "-avoid_negative_ts".into(), "make_zero".into()]);
+    } else {
+        if upscale_4k {
+            args.extend([
+                "-vf".into(),
+                "scale=w=3840:h=2160:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos".into(),
+            ]);
+        }
+        if hdr {
+            args.extend([
+                "-c:v".into(), "libx265".into(),
+                "-crf".into(), "18".into(),
+                "-pix_fmt".into(), "yuv420p10le".into(),
+                "-tag:v".into(), "hvc1".into(),
+            ]);
+            if src_hdr {
+                args.extend([
+                    "-color_primaries".into(), "bt2020".into(),
+                    "-color_trc".into(), "smpte2084".into(),
+                    "-colorspace".into(), "bt2020nc".into(),
+                    "-x265-params".into(),
+                    "hdr-opt=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc".into(),
+                ]);
+            }
+        } else {
+            args.extend([
+                "-c:v".into(), "libx264".into(),
+                "-preset".into(), "veryfast".into(),
+                "-crf".into(), "18".into(),
+                "-pix_fmt".into(), "yuv420p".into(),
+            ]);
+        }
+        args.extend(["-c:a".into(), "aac".into()]);
+    }
+    args.extend(["-movflags".into(), "+faststart".into()]);
+    args.push(out.to_string_lossy().into_owned());
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(copy: bool, hdr: bool, up: bool, src_hdr: bool) -> String {
+        export_args(
+            Path::new("in.mov"),
+            Path::new("out.mp4"),
+            Region { start_s: 1.0, end_s: 3.5 },
+            copy, hdr, up, src_hdr,
+        )
+        .join(" ")
+    }
+
+    #[test]
+    fn export_args_match_options() {
+        let copy = args(true, false, false, false);
+        assert!(copy.contains("-c copy") && copy.contains("-t 2.500"));
+
+        // 10-bit on an SDR source: HEVC, but no invented HDR tags.
+        let sdr10 = args(false, true, false, false);
+        assert!(sdr10.contains("libx265") && sdr10.contains("yuv420p10le"));
+        assert!(!sdr10.contains("smpte2084"));
+
+        // Real HDR source keeps its PQ/BT.2020 signalling.
+        assert!(args(false, true, false, true).contains("transfer=smpte2084"));
+
+        // Upscale fits inside 4K instead of stretching, and forces re-encode.
+        let up = args(false, false, true, false);
+        assert!(up.contains("scale=w=3840:h=2160:force_original_aspect_ratio=decrease"));
+        assert!(up.contains("libx264"));
+    }
 
     // Smallest check that fails if the seek/decode core breaks: open a synth
     // clip, grab an exact frame mid-file, then step forward sequentially.
@@ -482,6 +565,10 @@ impl eframe::App for ClipperApp {
                 }
                 ui.separator();
                 ui.checkbox(&mut self.force_reencode, "Force re-encode (frame-accurate)");
+                ui.checkbox(&mut self.hdr, "HDR / 10-bit")
+                    .on_hover_text("Re-encode as 10-bit HEVC. Keeps HDR sources HDR; on an SDR source it just avoids banding (no fake tone-mapping).");
+                ui.checkbox(&mut self.upscale_4k, "Upscale 4K")
+                    .on_hover_text("Lanczos upscale to fit 3840x2160, aspect preserved. Never downscales larger sources below 4K.");
                 if ui.button("Output folder…").clicked() {
                     self.out_dir = rfd::FileDialog::new().pick_folder();
                 }
@@ -499,36 +586,6 @@ impl eframe::App for ClipperApp {
             ui.heading("Regions");
             ui.small("I = set In · O = commit region · Space = play · ←/→ = step");
             ui.separator();
-            let mut remove: Option<usize> = None;
-            let mut export_one: Option<usize> = None;
-            for (i, r) in self.regions.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.monospace(format!(
-                        "{:>2}  {} → {}  ({:.2}s)",
-                        i + 1,
-                        fmt_ts(r.start_s),
-                        fmt_ts(r.end_s),
-                        r.end_s - r.start_s
-                    ));
-                    if ui.small_button("▶").on_hover_text("Jump to start").clicked() {
-                        self.playhead_s = r.start_s;
-                    }
-                    if ui.add_enabled(!self.exporting, egui::Button::new("💾").small()).clicked() {
-                        export_one = Some(i);
-                    }
-                    if ui.small_button("✕").clicked() {
-                        remove = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = remove {
-                self.regions.remove(i);
-            }
-            if let Some(i) = export_one {
-                let r = vec![self.regions[i]];
-                self.start_export(r);
-            }
-            ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Set In (I)").clicked() {
                     self.pending_in = Some(self.playhead_s);
@@ -544,6 +601,39 @@ impl eframe::App for ClipperApp {
                 .clicked()
             {
                 self.start_export(self.regions.clone());
+            }
+            ui.separator();
+
+            let mut remove: Option<usize> = None;
+            let mut export_one: Option<usize> = None;
+            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                for (i, r) in self.regions.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.monospace(format!(
+                            "{:>2}  {} → {}  ({:.2}s)",
+                            i + 1,
+                            fmt_ts(r.start_s),
+                            fmt_ts(r.end_s),
+                            r.end_s - r.start_s
+                        ));
+                        if ui.small_button("▶").on_hover_text("Jump to start").clicked() {
+                            self.playhead_s = r.start_s;
+                        }
+                        if ui.add_enabled(!self.exporting, egui::Button::new("💾").small()).clicked() {
+                            export_one = Some(i);
+                        }
+                        if ui.small_button("✕").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+            });
+            if let Some(i) = remove {
+                self.regions.remove(i);
+            }
+            if let Some(i) = export_one {
+                let r = vec![self.regions[i]];
+                self.start_export(r);
             }
         });
 
